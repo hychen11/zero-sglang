@@ -12,6 +12,7 @@ sglang-omni-learning/
 │   ├── scheduler_deep_dive.md config → topology, Coordinator vs Scheduler, SGLang integration, KV, TTFT/TPOT levers
 │   ├── communication.md       control plane, transport selection, per-edge transports, lifetimes
 │   ├── reading_roadmap.md     reading order, data structures, exercise, coverage
+│   ├── docker_dev_setup.md    Docker setup, starting services, the edit-and-restart loop (中文)
 │   └── execution-trace.json   the data behind the explorer
 └── explorer/                  interactive web explorer
 ```
