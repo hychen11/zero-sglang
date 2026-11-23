@@ -1,0 +1,2824 @@
+{
+  "schemaVersion": 1,
+  "mode": "STATIC",
+  "provenance": {
+    "repository": "sgl-project/sglang-omni",
+    "commit": "b62b0f94eb4ed3a301876d08a583f4bb58708f77",
+    "method": "Read source at this commit; every code reference is an anchor string located in the file at build time by docs/interactive-explorer/scripts/extract-snippets.mjs.",
+    "measured": false,
+    "note": "No step carries timing. Payload examples are shapes with values substituted from the explorer's request form; they are synthetic, not captured."
+  },
+  "subject": {
+    "pipelineConfig": "Qwen3OmniPipelineConfig (text) and Qwen3OmniSpeechPipelineConfig (text+audio)",
+    "request": "POST /v1/chat/completions, text input; text or text+audio output"
+  },
+  "scenarios": {
+    "stream": "Text in, text out, stream=true (SSE)",
+    "nonstream": "Text in, text out, stream=false (JSON)",
+    "speech": "Text in, text + audio out (modalities=[text, audio]) on Qwen3OmniSpeechPipelineConfig"
+  },
+  "groups": [
+    {
+      "id": "http_proc",
+      "label": "HTTP process (run_server)"
+    },
+    {
+      "id": "pipe_proc",
+      "label": "stages · text config: one process"
+    },
+    {
+      "id": "speech_proc",
+      "label": "speech-only stages · speech config: one process per stage"
+    }
+  ],
+  "components": [
+    {
+      "id": "http",
+      "label": "FastAPI chat_completions",
+      "category": "api",
+      "group": "http_proc",
+      "file": "sglang_omni/serve/openai_api.py",
+      "anchor": "    async def chat_completions(",
+      "span": 20,
+      "why": "Speak the OpenAI protocol without leaking it into the runtime.",
+      "owns": "Route registration, request/response schemas, SSE framing, HTTP status mapping.",
+      "interfaces": "POST /v1/chat/completions, /v1/audio/speech, /generate, /health, /v1/models, profiler routes",
+      "io": "ChatCompletionRequest → GenerateRequest; CompletionResult / CompletionStreamChunk → JSON / SSE",
+      "classes": "create_app, register_chat_completions, build_chat_generate_request, chat_non_stream, chat_stream_events",
+      "concurrency": "async handlers on the uvicorn event loop (HTTP process)",
+      "design": "create_app only builds routes over a live Client; launch_server/run_server owns pipeline startup.",
+      "debug": "Check the request_id and the converted GenerateRequest; 422 is schema, 503 is QueueFullError.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "client",
+      "label": "Client",
+      "category": "client",
+      "group": "http_proc",
+      "file": "sglang_omni/client/client.py",
+      "anchor": "class Client:",
+      "span": 13,
+      "why": "One internal API shared by every HTTP route.",
+      "owns": "GenerateRequest → OmniRequest conversion; GenerateChunk building; text/audio aggregation; stop-string trimming.",
+      "interfaces": "generate, completion, completion_stream, speech, abort, health",
+      "io": "GenerateRequest → OmniRequest; StreamMessage / result → GenerateChunk",
+      "classes": "Client, build_omni_request, extract_inputs, build_params, default_result_builder, default_stream_builder",
+      "concurrency": "async generators on the HTTP loop; stateless per request",
+      "design": "result_builder / stream_builder are injectable so pipelines with other result shapes reuse the same client.",
+      "debug": "Inspect the OmniRequest params dict: stream, max_new_tokens and stage_sampling all live there.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "coordinator",
+      "label": "Coordinator",
+      "category": "coordinator",
+      "group": "http_proc",
+      "file": "sglang_omni/pipeline/coordinator.py",
+      "anchor": "class Coordinator(SessionGraphRunner):",
+      "span": 12,
+      "why": "Own the request lifecycle across stages it does not understand.",
+      "owns": "requests (RequestInfo), completion_futures, stream_queues, stream_backlogs, partial_results, abort tasks.",
+      "interfaces": "submit, stream, submit_request, abort, run_completion_loop, handle_completion, handle_stream",
+      "io": "OmniRequest → SubmitMessage(StagePayload); CompleteMessage / StreamMessage → future / stream queue",
+      "classes": "Coordinator, CoordinatorControlPlane (PUSH submit, PULL completions, PUB abort)",
+      "concurrency": "single asyncio loop in the HTTP process; run_completion_loop is a background task",
+      "design": "Model-agnostic: knows only entry stage, terminal stages and an optional terminal_stages_resolver.",
+      "debug": "RequestInfo.state and expected_terminal_stages explain most hangs; profiler events request_admission / terminal_response.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "st_pre",
+      "label": "Stage: preprocessing (entry)",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/pipeline/stage/runtime.py",
+      "anchor": "class Stage:",
+      "span": 16,
+      "why": "IO shell: separate inter-stage IO from compute.",
+      "owns": "active_requests, aborted, stream_queue, replica_bindings, per-request stream counters.",
+      "interfaces": "run, on_submit, on_data_ready, receive_local_payload, execute, drain_outbox, route_result, send_to_stage",
+      "io": "SubmitMessage / DataReadyMessage / local payload → IncomingMessage; OutgoingMessage → next stage or coordinator",
+      "classes": "Stage, StageControlPlane, InputHandler (DirectInput / AggregatedInput), CommEngine, LocalStageDispatcher",
+      "concurrency": "coroutines on the process asyncio loop; scheduler in its own thread",
+      "design": "Never branches on scheduler type; all schedulers share inbox/outbox/start/stop/abort.",
+      "debug": "stage_input_received / stage_dispatch / stage_hop_sent events; check active_requests vs aborted.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "sch_pre",
+      "label": "SimpleScheduler + Qwen3OmniPreprocessor",
+      "category": "scheduler",
+      "group": "pipe_proc",
+      "file": "sglang_omni/scheduling/simple_scheduler.py",
+      "anchor": "class SimpleScheduler(Generic[ComputeInput, ComputeResult]):",
+      "span": 10,
+      "why": "Run a non-AR function per request behind the scheduler interface.",
+      "owns": "inbox, outbox, aborted set, optional batch collection.",
+      "interfaces": "start (start_serial / start_concurrent), stop, abort, enqueue",
+      "io": "IncomingMessage(new_request) → OutgoingMessage(result | error)",
+      "classes": "SimpleScheduler, Qwen3OmniPreprocessor (components/preprocessor.py)",
+      "concurrency": "dedicated thread; async compute functions run on the thread's own event loop",
+      "design": "Serial by default for preprocessing: threaded dispatch changed thinker batch composition and greedy outputs.",
+      "debug": "preprocess_start / preprocess_end events; prompt-length validation errors surface here.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "img_enc",
+      "label": "Stage: image_encoder (skipped)",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def image_encoder_stage(",
+      "span": 12,
+      "why": "Vision encoder; reached only when the request has images or video.",
+      "owns": "-",
+      "interfaces": "-",
+      "io": "-",
+      "classes": "create_image_encoder_executor",
+      "concurrency": "SimpleScheduler thread",
+      "design": "Routed per request by resolve_preprocessing_next_stages.",
+      "debug": "Not on this path.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "aud_enc",
+      "label": "Stage: audio_encoder (skipped)",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def audio_encoder_stage(",
+      "span": 13,
+      "why": "Audio encoder; reached only when the request has audio.",
+      "owns": "-",
+      "interfaces": "-",
+      "io": "-",
+      "classes": "create_audio_encoder_executor",
+      "concurrency": "SimpleScheduler thread",
+      "design": "Routed per request by resolve_preprocessing_next_stages.",
+      "debug": "Not on this path.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "st_agg",
+      "label": "Stage: mm_aggregate (fan-in)",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/pipeline/stage/input.py",
+      "anchor": "class AggregatedInput(InputHandler):",
+      "span": 16,
+      "why": "Join preprocessing and encoder outputs into thinker inputs.",
+      "owns": "AggregatedInput.pending, expected_sources per request.",
+      "interfaces": "AggregatedInput.receive / cancel",
+      "io": "StagePayloads from wait_for sources → merged StagePayload (merge_for_thinker)",
+      "classes": "AggregatedInput, resolve_mm_aggregate_wait_sources, merge_for_thinker",
+      "concurrency": "input handler runs on the stage asyncio loop",
+      "design": "wait_for_fn narrows static wait_for per request, so text-only requests do not wait on encoders.",
+      "debug": "stage_aggregate_ready event; a request stuck here is missing an expected source.",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ]
+    },
+    {
+      "id": "sch_agg",
+      "label": "SimpleScheduler (identity)",
+      "category": "scheduler",
+      "group": "pipe_proc",
+      "file": "sglang_omni/models/qwen3_omni/stages.py",
+      "anchor": "def create_aggregate_executor(",
+      "span": 14,
+      "why": "Graph join point; compute is trivial.",
+      "owns": "-",
+      "interfaces": "inbox/outbox",
+      "io": "payload → payload",
+      "classes": "create_aggregate_executor",
+      "concurrency": "dedicated thread",
+      "design": "GPU placement only for colocation (factory note).",
+      "debug": "-",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ]
+    },
+    {
+      "id": "st_thk",
+      "label": "Stage: thinker",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def thinker_stage(",
+      "span": 41,
+      "why": "IO shell for the AR LLM stage.",
+      "owns": "stream targets (decode), projection to decode.",
+      "interfaces": "same Stage surface",
+      "io": "StagePayload → stream chunks + final StagePayload",
+      "classes": "Stage, project_thinker_to_decode",
+      "concurrency": "asyncio loop + scheduler-thinker thread",
+      "design": "stream_to=[\"decode\"] in text mode; speech mode adds talker_ar and dynamic stream-done targets.",
+      "debug": "stage_first_stream_chunk_sent (stage=thinker) ≈ first token leaves the thinker.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "sch_thk",
+      "label": "OmniScheduler (thinker)",
+      "category": "scheduler",
+      "group": "pipe_proc",
+      "file": "sglang_omni/scheduling/omni_scheduler.py",
+      "anchor": "class OmniScheduler(Generic[RequestDataT]):",
+      "span": 22,
+      "why": "Reuse SGLang's AR scheduling inside a pipeline stage.",
+      "owns": "waiting_queue / running_batch (upstream state), pending request builds, aborted_request_ids, async_pending decode step.",
+      "interfaces": "enqueue, start, stop, abort, admin",
+      "io": "StagePayload → SGLang Req (request_builder); finished Req → StagePayload (result_adapter); tokens → stream OutgoingMessages",
+      "classes": "OmniScheduler, make_thinker_scheduler_adapters, make_thinker_stream_output_builder, create_thinker_scheduler",
+      "concurrency": "dedicated thread; request-build thread pool; async-decode lookahead keeps two decode steps in flight",
+      "design": "Composition: upstream Scheduler methods bound via __getattr__; overrides recv_requests, process_input_requests, run_batch, stream_output.",
+      "debug": "scheduler_queue_enter, scheduler_prefill_start/end, scheduler_first_emit events.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "sglang",
+      "label": "SGLang upstream (Scheduler, TpModelWorker, KV)",
+      "category": "external",
+      "group": "pipe_proc",
+      "file": "sglang_omni/scheduling/omni_scheduler.py",
+      "anchor": "    def __getattr__(self, name: str):",
+      "span": 31,
+      "why": "Batch selection, radix cache, KV pools, CUDA graphs, attention kernels.",
+      "owns": "token_to_kv_pool, req_to_token_pool, tree_cache.",
+      "interfaces": "get_next_batch_to_run, process_batch_result, forward_batch_generation",
+      "io": "ScheduleBatch → GenerationBatchResult",
+      "classes": "external dependency (sglang.srt)",
+      "concurrency": "runs on the scheduler-thinker thread",
+      "design": "External boundary: this explorer does not describe its internals as verified.",
+      "debug": "SGLang server-args overrides via engine.* in the stage config.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "mr_thk",
+      "label": "Qwen3OmniThinkerModelRunner",
+      "category": "runner",
+      "group": "pipe_proc",
+      "file": "sglang_omni/model_runner/base.py",
+      "anchor": "    def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:",
+      "span": 20,
+      "why": "Model-specific hooks around a shared forward/sample path.",
+      "owns": "sampling seeds, host staging buffers, prompt hidden store (speech).",
+      "interfaces": "execute, execute_launch, execute_resolve, before_prefill, custom_prefill_forward, post_prefill/decode",
+      "io": "SchedulerOutput → ModelRunnerOutput",
+      "classes": "ModelRunner → ThinkerModelRunner → Qwen3OmniThinkerModelRunner",
+      "concurrency": "scheduler-thinker thread, GPU streams",
+      "design": "Text-only prefill attaches plain text embeds as a sidecar so breakable prefill CUDA graphs apply.",
+      "debug": "Use the omni-gpu-deep-dive skill / torch profiler for kernel time.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "st_dec",
+      "label": "Stage: decode (terminal)",
+      "category": "stage",
+      "group": "pipe_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def decode_stage(",
+      "span": 9,
+      "why": "Terminal stage: turn token ids into text and report to the coordinator.",
+      "owns": "per-request stream state on the Stage side.",
+      "interfaces": "same Stage surface; send_stream_to_coordinator, send_complete",
+      "io": "stream chunks + StagePayload → StreamMessage(s) + CompleteMessage",
+      "classes": "Stage",
+      "concurrency": "asyncio loop + scheduler-decode thread",
+      "design": "can_accept_stream_before_payload=True because token chunks precede the thinker's payload.",
+      "debug": "stage_first_stream_chunk_sent (to coordinator) ≈ first text byte toward the client.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "sch_dec",
+      "label": "StreamingDetokenizeScheduler",
+      "category": "scheduler",
+      "group": "pipe_proc",
+      "file": "sglang_omni/scheduling/streaming_detokenizer.py",
+      "anchor": "class StreamingDetokenizeScheduler:",
+      "span": 20,
+      "why": "UTF-8-safe incremental detokenization.",
+      "owns": "request_states (pending_tokens, payload, done), bounded done_seen.",
+      "interfaces": "start, stop, abort",
+      "io": "stream_chunk / stream_done / new_request → text deltas + final result",
+      "classes": "StreamingDetokenizeScheduler, build_decode_result (Qwen)",
+      "concurrency": "dedicated thread polling inbox with 0.1s timeout",
+      "design": "Handles stream_done before or after the payload.",
+      "debug": "A request whose payload never arrives keeps state until abort.",
+      "scenarios": [
+        "stream",
+        "nonstream",
+        "speech"
+      ]
+    },
+    {
+      "id": "st_tk",
+      "label": "Stage: talker_ar (gpu 1)",
+      "category": "stage",
+      "group": "speech_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def talker_stage(",
+      "span": 33,
+      "why": "IO shell for the talker AR model: fan-in of prompt state plus a stream of thinker tokens.",
+      "owns": "pre-payload stream queue; code2wav stream target.",
+      "interfaces": "same Stage surface",
+      "io": "preprocessing/encoder payloads + thinker token stream → codec code stream + latch payload",
+      "classes": "Stage, merge_for_talker, project_talker_to_code2wav",
+      "concurrency": "own process (speech config), asyncio loop + scheduler thread",
+      "design": "can_accept_stream_before_payload=True: thinker tokens may arrive before the fan-in payload is complete.",
+      "debug": "scheduler_request_build_start (stage=talker_ar) marks partial start.",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "id": "sch_tk",
+      "label": "QwenTalkerScheduler",
+      "category": "scheduler",
+      "group": "speech_proc",
+      "file": "sglang_omni/models/qwen3_omni/talker_scheduler.py",
+      "anchor": "class QwenTalkerScheduler",
+      "span": 26,
+      "why": "An OmniScheduler with talker-specific readiness.",
+      "owns": "deferred payloads, pending_stream_ingress, excluded_batch.",
+      "interfaces": "is_request_build_ready, complete_without_generation, update_running_batch",
+      "io": "StagePayload + StreamItems → SGLang Req",
+      "classes": "QwenTalkerScheduler(OmniScheduler)",
+      "concurrency": "dedicated thread",
+      "design": "Starts after partial_start_min_chunks thinker tokens; excludes decode rows whose next text has not arrived.",
+      "debug": "'talker rows excluded from a decode step' log line counts stalls.",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "id": "mr_tk",
+      "label": "QwenTalkerModelRunner",
+      "category": "runner",
+      "group": "speech_proc",
+      "file": "sglang_omni/models/qwen3_omni/talker_model_runner.py",
+      "anchor": "class QwenTalkerModelRunner",
+      "span": 25,
+      "why": "Talker forward with a feedback loop: each step's codec embedding is the next step's input together with thinker text.",
+      "owns": "pending_codec_rows, pending_feedback_queue per request.",
+      "interfaces": "post_decode, emit_code_chunks_and_feedback, ready_decode_rows, on_request_finished",
+      "io": "ScheduleBatch → codec codes (stream to code2wav) + feedback rows",
+      "classes": "QwenTalkerModelRunner(ModelRunner)",
+      "concurrency": "talker scheduler thread, GPU 1",
+      "design": "Emits code chunks straight into the outbox; coalesces 10 rows after the first 10.",
+      "debug": "Check codec_coalesce_* factory args vs code2wav window size.",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "id": "st_c2w",
+      "label": "Stage: code2wav (terminal if audio)",
+      "category": "stage",
+      "group": "speech_proc",
+      "file": "sglang_omni/models/qwen3_omni/config.py",
+      "anchor": "def code2wav_stage(",
+      "span": 10,
+      "why": "Terminal stage turning codec codes into waveform.",
+      "owns": "per-request stream state on the Stage side.",
+      "interfaces": "same Stage surface",
+      "io": "code stream + latch payload → audio StreamMessages + CompleteMessage",
+      "classes": "Stage",
+      "concurrency": "own process on GPU 0 (or inside the talker's process when colocated)",
+      "design": "gpu_memory_fraction=0.02; terminal_stages_fn adds it only for audio requests.",
+      "debug": "code2wav_first_audio profiler event.",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "id": "sch_c2w",
+      "label": "Code2WavScheduler",
+      "category": "scheduler",
+      "group": "speech_proc",
+      "file": "sglang_omni/models/qwen3_omni/components/code2wav_scheduler.py",
+      "anchor": "class Code2WavScheduler",
+      "span": 20,
+      "why": "Windowed streaming vocoder.",
+      "owns": "Code2WavStreamState per request: chunks, audio_parts, pending window, pinned slots.",
+      "interfaces": "ingest, window_ready, run_ready_step, final_result_data",
+      "io": "codec rows → 24 kHz audio windows",
+      "classes": "Code2WavScheduler(StreamingVocoderBase)",
+      "concurrency": "dedicated thread; decode stream; pinned D2H slots",
+      "design": "stream_chunk_size=10 new frames per window with left_context_size=25; groups same-length windows across requests.",
+      "debug": "No audio at all raises 'code2wav produced no audio' unless NO_SPEECH.",
+      "scenarios": [
+        "speech"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "source": "http",
+      "target": "client",
+      "kind": "control",
+      "label": "GenerateRequest"
+    },
+    {
+      "source": "client",
+      "target": "coordinator",
+      "kind": "control",
+      "label": "OmniRequest"
+    },
+    {
+      "source": "coordinator",
+      "target": "st_pre",
+      "kind": "control",
+      "label": "SubmitMessage · ZMQ PUSH",
+      "crossProcess": true
+    },
+    {
+      "source": "st_pre",
+      "target": "sch_pre",
+      "kind": "control",
+      "label": "inbox / outbox"
+    },
+    {
+      "source": "st_pre",
+      "target": "img_enc",
+      "kind": "data",
+      "label": "only with images",
+      "skipped": true
+    },
+    {
+      "source": "st_pre",
+      "target": "aud_enc",
+      "kind": "data",
+      "label": "only with audio",
+      "skipped": true
+    },
+    {
+      "source": "img_enc",
+      "target": "st_agg",
+      "kind": "data",
+      "label": "encoder_outs",
+      "skipped": true
+    },
+    {
+      "source": "aud_enc",
+      "target": "st_agg",
+      "kind": "data",
+      "label": "encoder_outs",
+      "skipped": true
+    },
+    {
+      "source": "st_pre",
+      "target": "st_agg",
+      "kind": "data",
+      "label": "StagePayload · local_object"
+    },
+    {
+      "source": "st_agg",
+      "target": "sch_agg",
+      "kind": "control",
+      "label": "inbox / outbox"
+    },
+    {
+      "source": "sch_agg",
+      "target": "st_thk",
+      "kind": "data",
+      "label": "StagePayload · local_object"
+    },
+    {
+      "source": "st_thk",
+      "target": "sch_thk",
+      "kind": "control",
+      "label": "inbox / outbox"
+    },
+    {
+      "source": "sch_thk",
+      "target": "sglang",
+      "kind": "control",
+      "label": "__getattr__ delegation"
+    },
+    {
+      "source": "sglang",
+      "target": "mr_thk",
+      "kind": "control",
+      "label": "ScheduleBatch"
+    },
+    {
+      "source": "mr_thk",
+      "target": "sch_thk",
+      "kind": "data",
+      "label": "ModelRunnerOutput"
+    },
+    {
+      "source": "st_thk",
+      "target": "st_dec",
+      "kind": "stream",
+      "label": "token chunks + stream_done + payload"
+    },
+    {
+      "source": "st_dec",
+      "target": "sch_dec",
+      "kind": "control",
+      "label": "inbox / outbox"
+    },
+    {
+      "source": "st_dec",
+      "target": "coordinator",
+      "kind": "stream",
+      "label": "StreamMessage / CompleteMessage · ZMQ",
+      "crossProcess": true
+    },
+    {
+      "source": "coordinator",
+      "target": "client",
+      "kind": "stream",
+      "label": "stream queue / future"
+    },
+    {
+      "source": "client",
+      "target": "http",
+      "kind": "stream",
+      "label": "GenerateChunk"
+    },
+    {
+      "source": "st_thk",
+      "target": "st_tk",
+      "kind": "stream",
+      "label": "token chunks (inline batch)",
+      "crossProcess": true,
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "st_pre",
+      "target": "st_tk",
+      "kind": "data",
+      "label": "StagePayload · SHM",
+      "crossProcess": true,
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "st_tk",
+      "target": "sch_tk",
+      "kind": "control",
+      "label": "inbox / outbox",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "sch_tk",
+      "target": "mr_tk",
+      "kind": "control",
+      "label": "ScheduleBatch",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "mr_tk",
+      "target": "st_tk",
+      "kind": "stream",
+      "label": "codec rows → outbox",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "st_tk",
+      "target": "st_c2w",
+      "kind": "stream",
+      "label": "codec codes · CUDA IPC relay",
+      "crossProcess": true,
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "st_c2w",
+      "target": "sch_c2w",
+      "kind": "control",
+      "label": "inbox / outbox",
+      "scenarios": [
+        "speech"
+      ]
+    },
+    {
+      "source": "st_c2w",
+      "target": "coordinator",
+      "kind": "stream",
+      "label": "audio StreamMessage / CompleteMessage · ZMQ",
+      "crossProcess": true,
+      "scenarios": [
+        "speech"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "http-handler",
+      "title": "FastAPI handler receives the request",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "http",
+      "lane": "http",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "chat_completions (registered by register_chat_completions)",
+      "caller": "uvicorn / FastAPI router",
+      "callee": "build_chat_generate_request, then chat_stream or chat_non_stream",
+      "code": [
+        {
+          "file": "sglang_omni/serve/openai_api.py",
+          "anchor": "    async def chat_completions(",
+          "span": 48
+        }
+      ],
+      "input": "ChatCompletionRequest (serve/protocol.py)",
+      "output": "StreamingResponse (text/event-stream) or JSONResponse",
+      "requestPayload": "POST /v1/chat/completions\n{\n  \"messages\": [{\"role\": \"user\", \"content\": \"{{prompt}}\"}],\n  \"max_tokens\": {{max_tokens}},\n  \"stream\": {{stream}}\n}",
+      "outputPayload": "gen_req: GenerateRequest(...)\nrequest_id = \"{{request_id}}\"\nresponse_id = \"chatcmpl-{{request_id}}\"",
+      "state": "Assigns request_id (req.request_id or uuid4) and response_id. No runtime state yet.",
+      "crossProcess": null,
+      "errors": "Schema validation fails with 422 before the handler runs.",
+      "rationale": "The HTTP layer only translates the OpenAI protocol; it never touches stages.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "build-generate-request",
+      "title": "ChatCompletionRequest → GenerateRequest",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "http",
+      "lane": "http",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "build_chat_generate_request",
+      "caller": "chat_completions",
+      "callee": "SamplingParams(...), Message(...), GenerateRequest(...)",
+      "code": [
+        {
+          "file": "sglang_omni/serve/openai_api.py",
+          "anchor": "def build_chat_generate_request(",
+          "span": 30
+        }
+      ],
+      "input": "ChatCompletionRequest",
+      "output": "GenerateRequest (client/types.py)",
+      "requestPayload": "ChatCompletionRequest(messages=[...], max_tokens={{max_tokens}}, stream={{stream}}, modalities=None)",
+      "outputPayload": "GenerateRequest(\n  messages=[Message(role=\"user\", content=\"{{prompt}}\")],\n  sampling=SamplingParams(max_new_tokens={{max_tokens}}, stop=[], ...),\n  stream={{stream}},\n  max_tokens={{max_tokens}},\n  output_modalities=[\"text\"],   # req.modalities or [\"text\"]\n  metadata={},                  # no media in this request\n  extra_params={}\n)",
+      "state": "None (pure conversion).",
+      "crossProcess": null,
+      "errors": "SamplingParams(**params) for stage_sampling can raise on unknown keys.",
+      "rationale": "The one place OpenAI field names become runtime names: media and video options go into metadata, talker overrides into extra_params.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "client-build-omni",
+      "title": "Client: GenerateRequest → OmniRequest",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "client",
+      "edgeFrom": "http",
+      "lane": "client",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Client.generate → Client.build_omni_request (extract_inputs, build_params)",
+      "caller": "Client.completion_stream (stream) / Client.completion (non-stream)",
+      "callee": "Coordinator.stream (stream) / Coordinator.submit (non-stream)",
+      "code": [
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "    async def generate(",
+          "span": 25
+        },
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "    def build_omni_request(",
+          "span": 14
+        }
+      ],
+      "input": "GenerateRequest",
+      "output": "OmniRequest (proto/request.py)",
+      "requestPayload": "GenerateRequest(messages=[...], stream={{stream}}, ...)",
+      "outputPayload": "OmniRequest(\n  inputs=[{\"role\": \"user\", \"content\": \"{{prompt}}\"}],   # a plain list: no media\n  params={\"max_new_tokens\": {{max_tokens}}, \"stream\": {{stream}}, \"temperature\": ..., \"stop\": [], ...},\n  metadata={\"output_modalities\": [\"text\"]}\n)",
+      "state": "None; the client is stateless per request.",
+      "crossProcess": null,
+      "errors": "extract_inputs raises ValueError unless exactly one of prompt / prompt_token_ids / messages is set.",
+      "rationale": "One internal API serves chat, speech, /generate and realtime routes, so the Coordinator only ever sees OmniRequest.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "coordinator-admit",
+      "title": "Coordinator admits the request and wraps it in a StagePayload",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "coordinator",
+      "edgeFrom": "client",
+      "lane": "coordinator",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Coordinator.stream / Coordinator.submit → Coordinator.submit_request",
+      "caller": "Client.generate",
+      "callee": "CoordinatorControlPlane.submit_to_stage",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "    async def submit_request(",
+          "span": 20
+        },
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "        payload = StagePayload(",
+          "span": 40
+        }
+      ],
+      "input": "request_id, OmniRequest, stream_queue (stream only)",
+      "output": "SubmitMessage(request_id, data=StagePayload, replica_bindings)",
+      "requestPayload": "OmniRequest(inputs=[...], params={...}, metadata={...})",
+      "outputPayload": "StagePayload(\n  request_id=\"{{request_id}}\",\n  request=OmniRequest(...),\n  data={\"raw_inputs\": [{\"role\": \"user\", \"content\": \"{{prompt}}\"}]}\n)",
+      "state": "requests[rid] = RequestInfo(state=PENDING, terminal_stages={\"decode\"}) → RUNNING after send.\ncompletion_futures[rid] = Future.\nstream only: stream_queues[rid] = asyncio.Queue(), stream_backlogs[rid] = StreamBacklog(0, now).",
+      "crossProcess": null,
+      "errors": "fatal_error → RuntimeError; duplicate ID → ValueError; in-flight cap → QueueFullError (HTTP 503). A failed send drops the request without an abort (no stage holds it yet).",
+      "rationale": "The Coordinator owns lifecycle (admission, terminal collection, abort) and stays model-agnostic.",
+      "events": [
+        "request_admission"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "zmq-submit",
+      "title": "SubmitMessage over ZMQ PUSH to the entry stage",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_pre",
+      "edgeFrom": "coordinator",
+      "lane": "coordinator",
+      "thread": "HTTP process → pipeline process",
+      "plane": "control",
+      "boundary": "process",
+      "function": "CoordinatorControlPlane.submit_to_stage → PushSocket.send",
+      "caller": "Coordinator.submit_request",
+      "callee": "preprocessing Stage.run (PULL socket recv)",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/control_plane.py",
+          "anchor": "    async def submit_to_stage(",
+          "span": 15
+        },
+        {
+          "file": "sglang_omni/pipeline/control_plane.py",
+          "anchor": "        data = serialize_message(msg)",
+          "span": 4
+        }
+      ],
+      "input": "SubmitMessage",
+      "output": "msgpack bytes on the stage's PULL endpoint",
+      "requestPayload": "SubmitMessage(request_id=\"{{request_id}}\", data=StagePayload(...), replica_bindings={})",
+      "outputPayload": "(bytes on the wire)",
+      "state": "stage_sockets[\"preprocessing\"] = PushSocket (lazily connected once).",
+      "crossProcess": "ZMQ PUSH → PULL. HTTP process → pipeline process. The first StagePayload is small (chat messages only), so it rides inside the control message; no relay is involved.",
+      "errors": "A ZMQ send either queues the whole message or raises.",
+      "rationale": "ZMQ carries coordination and small control metadata; bulk tensors use the comm layer (not needed on this path).",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "pre-on-submit",
+      "title": "Preprocessing Stage: on_submit → execute → scheduler inbox",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_pre",
+      "lane": "preprocessing",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "control",
+      "boundary": "async→thread",
+      "function": "Stage.run → handle_message → on_submit → execute",
+      "caller": "Stage.run recv loop",
+      "callee": "SimpleScheduler.enqueue (inbox.put)",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    async def on_submit(self, msg: SubmitMessage) -> None:",
+          "span": 29
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "        msg = IncomingMessage(request_id=request_id, type=\"new_request\", data=payload)",
+          "span": 6
+        }
+      ],
+      "input": "SubmitMessage",
+      "output": "IncomingMessage(type=\"new_request\", data=StagePayload)",
+      "requestPayload": "SubmitMessage(data=StagePayload(data={\"raw_inputs\": [...]}))",
+      "outputPayload": "IncomingMessage(request_id=\"{{request_id}}\", type=\"new_request\", data=StagePayload(...))",
+      "state": "active_requests.add(rid); stream_queue.open(rid).",
+      "crossProcess": null,
+      "errors": "A request ID in self.aborted (retired after abort/failure) is refused with send_failure.",
+      "rationale": "Stage is an IO shell: it never branches on scheduler type, all compute goes through inbox/outbox.",
+      "events": [
+        "stage_input_received",
+        "stage_dispatch"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "pre-compute",
+      "title": "Preprocessing compute: chat template, tokenize, build pipeline state",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_pre",
+      "edgeFrom": "st_pre",
+      "lane": "preprocessing",
+      "thread": "scheduler-preprocessing thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "SimpleScheduler.run_single → Qwen3OmniPreprocessor.__call__ → call_impl → finalize_state",
+      "caller": "SimpleScheduler.start_serial loop",
+      "callee": "processor.apply_chat_template, tokenizer, finalize_state; emit_result → outbox",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/simple_scheduler.py",
+          "anchor": "    def run_single(self, msg: IncomingMessage, loop: asyncio.AbstractEventLoop) -> None:",
+          "span": 21
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/preprocessor.py",
+          "anchor": "            prompt_text = self.processor.apply_chat_template(",
+          "span": 14
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/preprocessor.py",
+          "anchor": "    def finalize_state(",
+          "span": 28
+        }
+      ],
+      "input": "StagePayload(data={\"raw_inputs\": ...}, request.inputs=[messages])",
+      "output": "OutgoingMessage(type=\"result\", data=StagePayload with Qwen3OmniPipelineState)",
+      "requestPayload": "payload.request.inputs = [{\"role\": \"user\", \"content\": \"{{prompt}}\"}]",
+      "outputPayload": "payload.data = Qwen3OmniPipelineState(\n  prompt={\"prompt_text\": \"<|im_start|>user\\n{{prompt}}<|im_end|>\\n<|im_start|>assistant\\n\",\n          \"input_ids\": Tensor[n_tokens], \"attention_mask\": Tensor[n_tokens]},\n  mm_inputs={...}, encoder_inputs={...},   # no model inputs: no media\n  stream_state={\"token_ids\": [], \"text\": \"\"}\n).to_dict()\npayload.request.inputs = None   # raw inputs dropped",
+      "state": "payload.request.inputs cleared; media keys popped from metadata so later hops do not carry raw media.",
+      "crossProcess": null,
+      "errors": "An exception becomes OutgoingMessage(type=\"error\"); the stage turns it into CompleteMessage(success=False). Prompt too long for max_new_tokens raises in validate_prompt_text_len.",
+      "rationale": "Serial by default (max_concurrency=1): threaded dispatch changed thinker batch composition and flipped greedy bf16 MoE answers in CI (factory comment).",
+      "events": [
+        "preprocess_start",
+        "preprocess_end"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "pre-route",
+      "title": "Route the preprocessing result (data-driven)",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_pre",
+      "edgeFrom": "sch_pre",
+      "lane": "preprocessing",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "control",
+      "boundary": "thread→async",
+      "function": "Stage.drain_outbox_external → Stage.route_result → get_next = resolve_preprocessing_next_stages",
+      "caller": "Stage.drain_outbox (background task)",
+      "callee": "Stage.send_to_stage(\"mm_aggregate\")",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "        actual = self.get_next(request_id, result)",
+          "span": 2
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def resolve_preprocessing_next_stages(",
+          "span": 10
+        }
+      ],
+      "input": "OutgoingMessage(type=\"result\")",
+      "output": "next_stages = [\"mm_aggregate\"]",
+      "requestPayload": "state.encoder_inputs has no pixel_values / input_features",
+      "outputPayload": "[*encoder_stages_with_model_inputs(...)  # → []\n , \"mm_aggregate\"]  →  [\"mm_aggregate\"]",
+      "state": "None yet; clear_request_state(rid) runs after routing on this stage.",
+      "crossProcess": null,
+      "errors": "Routing exceptions propagate to the outbox drain task (stage background-task failure).",
+      "rationale": "Per-request routing: a text request skips image_encoder and audio_encoder although they exist in the topology.",
+      "events": [
+        "stage_complete"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "hop-pre-agg",
+      "title": "Hop preprocessing → mm_aggregate (local_object)",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_agg",
+      "edgeFrom": "st_pre",
+      "lane": "preprocessing",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "data",
+      "boundary": "none",
+      "function": "Stage.send_to_stage → project_preprocessing_to_mm_aggregate → LocalStageDispatcher.send_payload",
+      "caller": "Stage.route_result",
+      "callee": "mm_aggregate Stage.receive_local_payload",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "        projector = self.project_payload.get(target)",
+          "span": 52
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def project_preprocessing_to_mm_aggregate(",
+          "span": 10
+        },
+        {
+          "file": "sglang_omni/pipeline/local_dispatch.py",
+          "anchor": "    async def send_payload(",
+          "span": 13
+        }
+      ],
+      "input": "StagePayload (full state)",
+      "output": "StagePayload (projected: prompt, lightweight mm_inputs, encoder metadata, stream_state)",
+      "requestPayload": "StagePayload(data=Qwen3OmniPipelineState(...))",
+      "outputPayload": "StagePayload(data={prompt, mm_inputs (lightweight), encoder_inputs (metadata), stream_state})",
+      "state": "None on the sender; the receiver records it next.",
+      "crossProcess": "None. Same OS process (process=\"pipeline\") and single target → Python object passed by reference. No serialization, ZMQ, or relay.",
+      "errors": "Missing endpoint/dispatcher raises RuntimeError.",
+      "rationale": "LOCAL_OBJECT is the cheapest transport; receivers must treat the object as read-only.",
+      "events": [
+        "stage_hop_sent"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "agg-fanin",
+      "title": "mm_aggregate fan-in: AggregatedInput → merge_for_thinker",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_agg",
+      "lane": "mm_aggregate",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "data",
+      "boundary": "none",
+      "function": "Stage.receive_payload_from_stage → AggregatedInput.receive → resolve_mm_aggregate_wait_sources → merge_for_thinker",
+      "caller": "LocalStageDispatcher.send_payload",
+      "callee": "Stage.execute(merged)",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    async def receive_payload_from_stage(",
+          "span": 35
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/input.py",
+          "anchor": "class AggregatedInput(InputHandler):",
+          "span": 75
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def resolve_mm_aggregate_wait_sources(",
+          "span": 13
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/merge.py",
+          "anchor": "def merge_for_thinker(",
+          "span": 32
+        }
+      ],
+      "input": "StagePayload from \"preprocessing\"",
+      "output": "merged StagePayload with state.thinker_inputs",
+      "requestPayload": "from_stage=\"preprocessing\", static wait_for=[preprocessing, image_encoder, audio_encoder]",
+      "outputPayload": "expected_sources = {\"preprocessing\"}   # narrowed per request\nmerge_for_thinker({\"preprocessing\": payload}) →\n  state.thinker_inputs = build_thinker_inputs(...)\n  state.encoder_inputs = {}; state.encoder_outs = {}",
+      "state": "AggregatedInput.pending[rid] exists only until all expected sources arrived (immediately here).",
+      "crossProcess": null,
+      "errors": "A source outside the expected set raises ValueError.",
+      "rationale": "Fan-in happens in the Stage's input handler, before the scheduler; the mm_aggregate scheduler is an identity function.",
+      "events": [
+        "stage_input_received",
+        "stage_aggregate_ready"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "agg-identity",
+      "title": "mm_aggregate identity scheduler → route to thinker",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_agg",
+      "edgeFrom": "st_agg",
+      "lane": "mm_aggregate",
+      "thread": "scheduler-mm_aggregate thread, then asyncio loop",
+      "plane": "control",
+      "boundary": "async→thread",
+      "function": "SimpleScheduler(_identity) → Stage.route_result(next=\"thinker\") → local_object hop",
+      "caller": "Stage.execute",
+      "callee": "thinker Stage.receive_local_payload → execute",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/stages.py",
+          "anchor": "def create_aggregate_executor(",
+          "span": 14
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/config.py",
+          "anchor": "def aggregate_stage(",
+          "span": 13
+        }
+      ],
+      "input": "merged StagePayload",
+      "output": "same StagePayload, routed to thinker",
+      "requestPayload": "StagePayload(data={..., thinker_inputs: {...}})",
+      "outputPayload": "StagePayload (unchanged)",
+      "state": "mm_aggregate clears its request state after routing.",
+      "crossProcess": "None (local_object).",
+      "errors": "Same as any SimpleScheduler stage.",
+      "rationale": "The aggregate stage exists as a join point in the graph; placing it on GPU is for colocation only (factory note).",
+      "events": [
+        "stage_hop_sent"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-enqueue",
+      "title": "Thinker Stage → OmniScheduler.enqueue",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_thk",
+      "edgeFrom": "sch_agg",
+      "lane": "thinker",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "control",
+      "boundary": "async→thread",
+      "function": "Stage.execute → OmniScheduler.enqueue",
+      "caller": "thinker Stage.receive_payload_from_stage",
+      "callee": "OmniScheduler.inbox (and optionally start_early_request_build)",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def enqueue(self, msg: IncomingMessage) -> None:",
+          "span": 7
+        }
+      ],
+      "input": "StagePayload",
+      "output": "IncomingMessage(type=\"new_request\") in inbox",
+      "requestPayload": "StagePayload(data={prompt, thinker_inputs, stream_state})",
+      "outputPayload": "IncomingMessage(request_id=\"{{request_id}}\", type=\"new_request\", data=StagePayload)",
+      "state": "early_request_build_futures[rid] may be set if an early build was submitted.",
+      "crossProcess": null,
+      "errors": "None here.",
+      "rationale": "Early request builds start the CPU-side Req construction from the stage thread ahead of the scheduler loop.",
+      "events": [
+        "stage_dispatch"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-build-req",
+      "title": "OmniScheduler builds a SGLang Req",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_thk",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread (+ request-build pool)",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "event_loop_async_decode → recv_requests → process_input_requests → run_request_builder → request_builder → build_sglang_thinker_request",
+      "caller": "OmniScheduler.start",
+      "callee": "QwenThinkerRequest(...) (a SGLang Req subclass)",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def event_loop_async_decode(self) -> None:",
+          "span": 12
+        },
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def run_request_builder(",
+          "span": 23
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "    def request_builder(payload: StagePayload) -> SGLangARRequestData:",
+          "span": 24
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "    request_class = QwenPromptHiddenRequest if has_prompt_rows else QwenThinkerRequest",
+          "span": 12
+        }
+      ],
+      "input": "StagePayload",
+      "output": "SGLangARRequestData(req=QwenThinkerRequest, input_ids, ...) with stage_payload back-pointer",
+      "requestPayload": "state.prompt[\"input_ids\"], payload.request.params = {max_new_tokens: {{max_tokens}}, stream: {{stream}}, ...}",
+      "outputPayload": "SGLangARRequestData(\n  req=QwenThinkerRequest(rid=\"{{request_id}}\", origin_input_ids=[...],\n                         sampling_params=SamplingParams(max_new_tokens={{max_tokens}}, ...)),\n  input_ids=Tensor, output_ids=req.output_ids,\n  stage_payload=StagePayload(...)\n)",
+      "state": "pending_request_builds[rid] while the build runs on the pool.",
+      "crossProcess": null,
+      "errors": "Build failure → emit_request_error (OutgoingMessage type=error) + abort(rid).",
+      "rationale": "Adapters translate between the pipeline's StagePayload and SGLang's Req, so the upstream scheduler runs unmodified.",
+      "events": [
+        "scheduler_request_build_start",
+        "scheduler_request_build_end"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-admit",
+      "title": "Admission into SGLang's waiting_queue",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread",
+      "plane": "control",
+      "boundary": "none",
+      "function": "OmniScheduler.enqueue_built_request → enqueue_if_live",
+      "caller": "drain_request_build_results / admit_or_defer_built_request",
+      "callee": "self.waiting_queue.append(req)",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "        def enqueue_if_live() -> None:",
+          "span": 38
+        }
+      ],
+      "input": "SGLangARRequestData",
+      "output": "req in waiting_queue with req.omni_data = req_data",
+      "requestPayload": "req.origin_input_ids (non-empty), sampling_params",
+      "outputPayload": "waiting_queue += [Req(rid=\"{{request_id}}\")]",
+      "state": "req.omni_data, req._omni_terminal_claimed = False, waiting_queue grows.",
+      "crossProcess": null,
+      "errors": "Empty prompt, context-length overflow (prepare_request_limits), KV capacity (request_kv_capacity_error), or queued limit → emit_request_error + abort.",
+      "rationale": "After this point the request is an ordinary SGLang Req: batch selection, radix cache, chunked prefill, and KV allocation are upstream.",
+      "events": [
+        "scheduler_queue_enter"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-batch",
+      "title": "Upstream SGLang selects a prefill batch",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sglang",
+      "edgeFrom": "sch_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "self.get_next_batch_to_run() resolved by OmniScheduler.__getattr__ on the upstream Scheduler class",
+      "caller": "event_loop_async_decode",
+      "callee": "upstream Scheduler.get_next_batch_to_run (prefix match, KV allocation, chunking)",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def __getattr__(self, name: str):",
+          "span": 31
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/stages.py",
+          "anchor": "    overrides = build_generation_batch_overrides(",
+          "span": 12
+        }
+      ],
+      "input": "waiting_queue, running_batch",
+      "output": "ScheduleBatch (forward_mode=EXTEND for prefill)",
+      "requestPayload": "waiting_queue=[Req(\"{{request_id}}\")]",
+      "outputPayload": "ScheduleBatch(reqs=[Req(\"{{request_id}}\"), ...], forward_mode=EXTEND)",
+      "state": "KV slots allocated in token_to_kv_pool; req_pool_idx assigned; possible radix-cache prefix hit.",
+      "crossProcess": null,
+      "errors": "Upstream retraction / OOM handling applies.",
+      "rationale": "Composition instead of inheritance: reuse SGLang's scheduling while overriding only intake, execution and output.",
+      "events": [
+        "scheduler_prefill_start"
+      ],
+      "status": "INFERRED",
+      "uncertainty": "The delegation via OmniScheduler.__getattr__ is verified; what upstream SGLang get_next_batch_to_run does inside (prefix match, KV allocation, chunking) is described from SGLang's design and was not read in this checkout."
+    },
+    {
+      "id": "thinker-forward",
+      "title": "ModelRunner: build ForwardBatch → before_prefill → forward → sample",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "mr_thk",
+      "edgeFrom": "sglang",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread · GPU",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "OmniScheduler._run_batch → ModelRunner.execute → prepare_and_forward → Qwen3OmniThinkerModelRunner.before_prefill → tp_worker.forward_batch_generation",
+      "caller": "OmniScheduler.run_batch",
+      "callee": "SGLang TpModelWorker.forward_batch_generation",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def _run_batch(self, batch, pp_proxy_tensors=None):",
+          "span": 26
+        },
+        {
+          "file": "sglang_omni/model_runner/base.py",
+          "anchor": "    def prepare_and_forward(",
+          "span": 37
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/thinker_model_runner.py",
+          "anchor": "    def before_prefill(",
+          "span": 41
+        }
+      ],
+      "input": "SchedulerOutput(requests=[SchedulerRequest(rid, omni_data)], batch_data=ScheduleBatch)",
+      "output": "ModelRunnerOutput(outputs={rid: RequestOutput(data=next_token_id)}, next_token_ids)",
+      "requestPayload": "ForwardBatch(input_ids=[prompt tokens], positions, out_cache_loc, ...)",
+      "outputPayload": "next_token_ids = Tensor[batch]  # first generated token for \"{{request_id}}\"",
+      "state": "KV cache written for the prompt; req.output_ids grows by one per step.",
+      "crossProcess": null,
+      "errors": "run_batch catches exceptions → handle_batch_failure fails the batch's requests.",
+      "rationale": "Hooks (before_prefill / custom_prefill_forward / post_prefill) inject multimodal embeddings; with no media, Qwen attaches plain text input embeds as a sidecar so breakable prefill CUDA graphs still apply.",
+      "events": [
+        "scheduler_prefill_end"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-stream-emit",
+      "title": "Per-token stream output to decode",
+      "scenarios": [
+        "stream"
+      ],
+      "node": "sch_thk",
+      "edgeFrom": "mr_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread",
+      "plane": "stream",
+      "boundary": "thread→async",
+      "function": "OmniScheduler.emit_stream_output → thinker stream_output_builder",
+      "caller": "OmniScheduler._run_batch / run_batch_resolve",
+      "callee": "put_messages(outbox, ...)",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def emit_stream_output(",
+          "span": 50
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def make_thinker_stream_output_builder(",
+          "span": 40
+        }
+      ],
+      "input": "ModelRunnerOutput for this step",
+      "output": "OutgoingMessage(type=\"stream\", target=\"decode\", data=tensor([token_id]))",
+      "requestPayload": "req_output.data = token_id; payload.request.params[\"stream\"] = {{stream}}",
+      "outputPayload": "OutgoingMessage(request_id=\"{{request_id}}\", type=\"stream\", target=\"decode\",\n                data=torch.tensor([token_id]), metadata={\"token_id\": token_id})",
+      "state": "first_emit_done.add(rid) on the first chunk.",
+      "crossProcess": null,
+      "errors": "A builder exception fails only that request (emit_request_error + abort).",
+      "rationale": "Only stream=true requests stream tokens to decode; non-stream requests deliver text only with the final result. Middle chunks of a chunked prefill are skipped.",
+      "events": [
+        "scheduler_first_emit"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "thinker-decode-loop",
+      "title": "Decode steps with async lookahead (repeats per token)",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread · GPU",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "event_loop_async_decode → run_batch_launch (step N) ‖ resolve_and_process (step N-1)",
+      "caller": "OmniScheduler.start",
+      "callee": "ModelRunner.execute_launch / execute_resolve",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def run_batch_launch(self, batch):",
+          "span": 10
+        },
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "            if use_lookahead:",
+          "span": 30
+        }
+      ],
+      "input": "running_batch (DECODE)",
+      "output": "one token per request per step; stream chunks as in the previous step (stream=true)",
+      "requestPayload": "running_batch.reqs includes \"{{request_id}}\"",
+      "outputPayload": "async_pending = PendingDecode(batch, scheduler_output, device_step)",
+      "state": "async_pending holds the launched step; previous step resolved and its results processed.",
+      "crossProcess": null,
+      "errors": "handle_batch_failure on launch or resolve failure.",
+      "rationale": "Launch-first keeps two decode steps in flight so CPU scheduling overlaps GPU execution.",
+      "events": [],
+      "status": "VERIFIED",
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "stream-hop-decode",
+      "title": "Thinker → decode stream chunk (local)",
+      "scenarios": [
+        "stream"
+      ],
+      "node": "st_dec",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "stream",
+      "boundary": "none",
+      "function": "Stage.drain_outbox_external → route_stream_run → LocalStageDispatcher.send_stream_chunks → decode.receive_local_stream_chunks → route_stream_item",
+      "caller": "thinker Stage.drain_outbox",
+      "callee": "decode scheduler inbox.put(IncomingMessage(type=\"stream_chunk\"))",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    async def route_stream_run(",
+          "span": 41
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    async def receive_local_stream_chunks(",
+          "span": 23
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    def route_stream_item(",
+          "span": 4
+        }
+      ],
+      "input": "OutgoingMessage(type=\"stream\", target=\"decode\")",
+      "output": "IncomingMessage(type=\"stream_chunk\", data=StreamItem(chunk_id, data, from_stage=\"thinker\"))",
+      "requestPayload": "LocalStreamChunk(request_id=\"{{request_id}}\", chunk_id=k, data=tensor([token_id]))",
+      "outputPayload": "IncomingMessage(request_id=\"{{request_id}}\", type=\"stream_chunk\", data=StreamItem(...))",
+      "state": "thinker: local_stream_targets[rid] ∋ \"decode\"; decode: active_requests.add(rid) (stream before payload).",
+      "crossProcess": "None (same process, by reference).",
+      "errors": "route_stream_item_or_fail turns routing errors into request failure.",
+      "rationale": "decode has can_accept_stream_before_payload=True because token chunks arrive before the thinker's final payload.",
+      "events": [
+        "stage_stream_chunk_received"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "detokenize",
+      "title": "Decode: incremental detokenize → text delta",
+      "scenarios": [
+        "stream"
+      ],
+      "node": "sch_dec",
+      "edgeFrom": "st_dec",
+      "lane": "decode",
+      "thread": "scheduler-decode thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "StreamingDetokenizeScheduler.on_stream_chunk → emit_text_delta",
+      "caller": "StreamingDetokenizeScheduler.start loop",
+      "callee": "outbox.put(OutgoingMessage(type=\"stream\", target=None))",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/streaming_detokenizer.py",
+          "anchor": "    def on_stream_chunk(",
+          "span": 17
+        },
+        {
+          "file": "sglang_omni/scheduling/streaming_detokenizer.py",
+          "anchor": "    def emit_text_delta(",
+          "span": 14
+        }
+      ],
+      "input": "StreamItem(data=tensor([token_id]))",
+      "output": "OutgoingMessage(type=\"stream\", target=None, data={\"text\", \"modality\": \"text\", \"stage_name\": \"decode\"})",
+      "requestPayload": "pending_tokens = [..., token_id]",
+      "outputPayload": "{\"text\": \"<delta>\", \"modality\": \"text\", \"stage_name\": \"decode\"}",
+      "state": "request_states[rid].pending_tokens cleared after a clean UTF-8 decode; kept if the text ends with U+FFFD.",
+      "crossProcess": null,
+      "errors": "An exception isolates the request: abort its state and emit OutgoingMessage(type=\"error\").",
+      "rationale": "Holding incomplete UTF-8 sequences avoids streaming broken characters.",
+      "events": [],
+      "status": "VERIFIED",
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "decode-to-coordinator",
+      "title": "Decode stream → Coordinator (StreamMessage over ZMQ)",
+      "scenarios": [
+        "stream"
+      ],
+      "node": "coordinator",
+      "edgeFrom": "st_dec",
+      "lane": "decode",
+      "thread": "pipeline process → HTTP process",
+      "plane": "stream",
+      "boundary": "process",
+      "function": "Stage.drain_outbox_external (untargeted stream) → Stage.send_stream_to_coordinator → StageControlPlane.send_stream",
+      "caller": "decode Stage.drain_outbox",
+      "callee": "Coordinator.run_completion_loop (PULL)",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "                        elif out.type == \"stream\":",
+          "span": 20
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    async def send_stream_to_coordinator(",
+          "span": 64
+        }
+      ],
+      "input": "OutgoingMessage(type=\"stream\", target=None)",
+      "output": "StreamMessage(request_id, from_stage=\"decode\", chunk={text...}, modality=\"text\", chunk_id)",
+      "requestPayload": "{\"text\": \"<delta>\", \"modality\": \"text\"}",
+      "outputPayload": "StreamMessage(request_id=\"{{request_id}}\", from_stage=\"decode\", chunk={\"text\": \"<delta>\", ...},\n              stage_name=\"decode\", modality=\"text\", chunk_id=k)",
+      "state": "stream_chunk_counters[(rid, \"coordinator\")] += 1; first_stream_chunk_seen.add(rid).",
+      "crossProcess": "ZMQ PUSH (stage) → PULL (coordinator completion endpoint). Pipeline process → HTTP process. One message per text delta.",
+      "errors": "Non-terminal stage emitting an untargeted stream raises RuntimeError.",
+      "rationale": "Only terminal stages talk to the coordinator; inner streams go stage-to-stage.",
+      "events": [
+        "stage_first_stream_chunk_sent",
+        "stage_stream_chunk_sent"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per text delta"
+    },
+    {
+      "id": "coordinator-stream",
+      "title": "Coordinator → Client → SSE delta",
+      "scenarios": [
+        "stream"
+      ],
+      "node": "http",
+      "edgeFrom": "coordinator",
+      "lane": "coordinator",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "stream",
+      "boundary": "none",
+      "function": "run_completion_loop → handle_stream → queue_stream_message → Coordinator.stream yields → Client.default_stream_builder → completion_stream → chat_stream_events",
+      "caller": "ZMQ PULL recv",
+      "callee": "FastAPI StreamingResponse body",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "    async def handle_stream(",
+          "span": 47
+        },
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "    def default_stream_builder(",
+          "span": 25
+        },
+        {
+          "file": "sglang_omni/serve/openai_api.py",
+          "anchor": "            # Text chunk",
+          "span": 12
+        }
+      ],
+      "input": "StreamMessage",
+      "output": "SSE line: data: {\"choices\":[{\"delta\":{\"content\": ...}}]}",
+      "requestPayload": "StreamMessage(chunk={\"text\": \"<delta>\"})",
+      "outputPayload": "data: {\"id\":\"chatcmpl-{{request_id}}\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"<delta>\"},\"finish_reason\":null}]}",
+      "state": "stream_backlogs[rid].undelivered_bytes up on queue, down when the reader takes it; reader_idle_since_s refreshed.",
+      "crossProcess": null,
+      "errors": "Over max_total_backlog_bytes, the stream with the longest-idle reader fails as a whole (QueueFullError).",
+      "rationale": "Whole-stream failure instead of dropping chunks: dropped chunks would corrupt the output.",
+      "events": [
+        "coordinator_stream_received"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per text delta"
+    },
+    {
+      "id": "thinker-finish",
+      "title": "Thinker request finishes → result payload",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_thk",
+      "edgeFrom": "mr_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread",
+      "plane": "control",
+      "boundary": "thread→async",
+      "function": "process_batch_result → upstream → OmniScheduler.stream_output → result_adapter → apply_thinker_result",
+      "caller": "upstream Scheduler.process_batch_result",
+      "callee": "outbox.put(OutgoingMessage(type=\"result\"))",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def stream_output(self, reqs, return_logprob=False, skip_req=None):",
+          "span": 10
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "    def result_adapter(data: SGLangARRequestData) -> StagePayload:",
+          "span": 10
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def apply_thinker_result(",
+          "span": 14
+        }
+      ],
+      "input": "finished Req (EOS, stop, or max_new_tokens)",
+      "output": "StagePayload with state.thinker_out",
+      "requestPayload": "req.output_ids = [t0, t1, ..., tN], req.finished_reason",
+      "outputPayload": "state.thinker_out = {\"output_ids\": [...], \"step\": N, \"is_final\": True,\n                     \"finish_reason\": \"stop\" | \"length\", \"extra_model_outputs\": {...}}",
+      "state": "req._omni_terminal_claimed = True under request_admission_lock; KV released (close_completed_request).",
+      "crossProcess": null,
+      "errors": "If the request was aborted mid-step (FINISH_ABORT or in aborted_request_ids) the result is dropped and only cleanup runs.",
+      "rationale": "stream_output is where upstream would send to its detokenizer process; sglang-omni redirects it into the stage outbox.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "thinker-route-decode",
+      "title": "Thinker → decode: stream_done first, then the projected payload",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "st_dec",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "pipeline process · asyncio loop",
+      "plane": "data",
+      "boundary": "none",
+      "function": "Stage.route_result → send_stream_signal_to_target(is_done) → send_to_stage(\"decode\") with project_thinker_to_decode",
+      "caller": "thinker Stage.drain_outbox",
+      "callee": "decode Stage.receive_stream_signal, decode Stage.receive_local_payload",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "        # Send stream done to the active stream targets for this request.",
+          "span": 22
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def project_thinker_to_decode(",
+          "span": 36
+        },
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    def can_send_full_payload_locally(",
+          "span": 16
+        }
+      ],
+      "input": "OutgoingMessage(type=\"result\", data=StagePayload)",
+      "output": "local stream_done signal + local StagePayload (projected)",
+      "requestPayload": "StagePayload(data={prompt, thinker_out, engine_outputs, stream_state, ...})",
+      "outputPayload": "StagePayload(data={prompt, thinker_out (extra_model_outputs={}),\n                  engine_outputs={\"thinker\": ...}, stream_state})",
+      "state": "local_stream_targets[rid] ∋ \"decode\" (recorded by the stream_done send), which permits the local_object payload hop.",
+      "crossProcess": "None (local).",
+      "errors": "Routing failures → send_failure.",
+      "rationale": "stream_done is sent before the payload so a streaming consumer always sees end-of-stream; projection drops what decode does not read.",
+      "events": [
+        "stage_complete",
+        "stage_hop_sent"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "decode-finalize",
+      "title": "Decode finalizes the result",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "sch_dec",
+      "edgeFrom": "st_dec",
+      "lane": "decode",
+      "thread": "scheduler-decode thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "on_stream_done → on_new_request → finalize → build_decode_result",
+      "caller": "StreamingDetokenizeScheduler.start loop",
+      "callee": "outbox.put(OutgoingMessage(type=\"result\"))",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/streaming_detokenizer.py",
+          "anchor": "    def on_new_request(",
+          "span": 14
+        },
+        {
+          "file": "sglang_omni/scheduling/streaming_detokenizer.py",
+          "anchor": "    def finalize(",
+          "span": 33
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/streaming_detokenizer.py",
+          "anchor": "def build_decode_result(",
+          "span": 66
+        }
+      ],
+      "input": "stream_done, then new_request(StagePayload)",
+      "output": "OutgoingMessage(type=\"result\", data=StagePayload(data=result dict))",
+      "requestPayload": "thinker_out.output_ids = [...]",
+      "outputPayload": "stream=true:  {\"events\": [...], \"finish_reason\": ..., \"usage\": {...}, \"modality\": \"text\"}   # text popped: already streamed\nstream=false: {\"events\": [...], \"text\": \"<full answer>\", \"finish_reason\": ..., \"usage\": {...}}",
+      "state": "request_states[rid] popped. Non-stream: stream_done arrived first with no state, so rid was parked in the bounded done_seen.",
+      "crossProcess": null,
+      "errors": "Exceptions isolate the request (error message to outbox).",
+      "rationale": "One decode stage serves both modes: streaming emits deltas as tokens arrive; non-streaming decodes once at the end.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "decode-complete",
+      "title": "Terminal decode → CompleteMessage to Coordinator",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "coordinator",
+      "edgeFrom": "st_dec",
+      "lane": "decode",
+      "thread": "pipeline process → HTTP process",
+      "plane": "control",
+      "boundary": "process",
+      "function": "decode Stage.route_result (get_next → None) → StageControlPlane.send_complete",
+      "caller": "decode Stage.drain_outbox",
+      "callee": "Coordinator.handle_completion",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "        if next_stages is None:",
+          "span": 22
+        }
+      ],
+      "input": "OutgoingMessage(type=\"result\")",
+      "output": "CompleteMessage(request_id, from_stage=\"decode\", success=True, result=result dict)",
+      "requestPayload": "StagePayload(data={text?, finish_reason, usage, events})",
+      "outputPayload": "CompleteMessage(request_id=\"{{request_id}}\", from_stage=\"decode\", success=True, result={...})",
+      "state": "decode clear_request_state(rid).",
+      "crossProcess": "ZMQ PUSH → coordinator PULL. Pipeline process → HTTP process.",
+      "errors": "A send failure propagates in the outbox drain task.",
+      "rationale": "Terminal-ness comes from the config (terminal=True); the route function returns None for it.",
+      "events": [
+        "stage_complete"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "coordinator-complete",
+      "title": "Coordinator resolves the request",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "coordinator",
+      "lane": "coordinator",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "run_completion_loop → Coordinator.handle_completion",
+      "caller": "ZMQ PULL recv",
+      "callee": "future.set_result / stream queue put",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "    async def handle_completion(",
+          "span": 16
+        },
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "        if len(expected_terminal_stages) <= 1:",
+          "span": 20
+        },
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "        # Fail-fast: any terminal failure -> fail entire request",
+          "span": 28
+        }
+      ],
+      "input": "CompleteMessage",
+      "output": "completion future resolved (non-stream) / CompleteMessage queued (stream)",
+      "requestPayload": "CompleteMessage(success=True, result={...})",
+      "outputPayload": "requests[rid].state = COMPLETED; future.set_result(result); requests.pop(rid)",
+      "state": "RequestInfo removed; completion future done.",
+      "crossProcess": null,
+      "errors": "success=False: state=FAILED, AbortMessage broadcast on PUB, future/stream failed (fail-fast).",
+      "rationale": "With one expected terminal the result resolves immediately; the speech pipeline instead collects decode + code2wav in partial_results and merges.",
+      "events": [
+        "terminal_response"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "http-response",
+      "title": "HTTP response: JSON body or SSE finish + [DONE]",
+      "scenarios": [
+        "stream",
+        "nonstream"
+      ],
+      "node": "http",
+      "edgeFrom": "client",
+      "lane": "http",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Client.completion → chat_non_stream (non-stream) / chat_stream_events finish chunk (stream)",
+      "caller": "chat_completions",
+      "callee": "uvicorn writes the response",
+      "code": [
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "    async def completion(",
+          "span": 50
+        },
+        {
+          "file": "sglang_omni/serve/openai_api.py",
+          "anchor": "    # Finish chunk: empty delta + finish_reason.",
+          "span": 24
+        }
+      ],
+      "input": "GenerateChunk(s)",
+      "output": "ChatCompletionResponse JSON / SSE finish chunk + data: [DONE]",
+      "requestPayload": "GenerateChunk(text=..., finish_reason=..., usage=...)",
+      "outputPayload": "stream=false: {\"id\":\"chatcmpl-{{request_id}}\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"...\"},\"finish_reason\":\"stop\"}],\"usage\":{...}}\nstream=true:  data: {...\"delta\":{},\"finish_reason\":\"stop\"...,\"usage\":{...}}\n              data: [DONE]",
+      "state": "Coordinator.stream returns once all expected terminals completed; its finally releases the stream queue.",
+      "crossProcess": null,
+      "errors": "After streaming starts, errors are sent in-band as data: {\"error\": ...} then [DONE] (chat_stream).",
+      "rationale": "Client aggregation keeps text, audio and usage assembly out of the HTTP layer.",
+      "events": [],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "sp-admit",
+      "title": "Admission: audio requested → two terminal stages",
+      "node": "coordinator",
+      "edgeFrom": "client",
+      "lane": "coordinator",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Coordinator.submit_request → resolve_terminal_stages(should_generate_audio_output)",
+      "caller": "Client.generate",
+      "callee": "CoordinatorControlPlane.submit_to_stage",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def should_generate_audio_output(",
+          "span": 11
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def resolve_terminal_stages(",
+          "span": 7
+        }
+      ],
+      "input": "OmniRequest(metadata.output_modalities=[\"text\",\"audio\"])",
+      "output": "RequestInfo(terminal_stages={decode, code2wav}) + SubmitMessage",
+      "requestPayload": "{\"messages\": [{\"role\": \"user\", \"content\": \"{{prompt}}\"}], \"modalities\": [\"text\", \"audio\"], \"stream\": {{stream}}}",
+      "outputPayload": "terminal_stages = {\"decode\", \"code2wav\"}",
+      "state": "requests[rid].terminal_stages = {decode, code2wav}",
+      "errors": "As in the text path.",
+      "rationale": "Audio is opt-in over HTTP: the chat route fills output_modalities with [\"text\"] unless modalities is given; a missing field would mean audio.",
+      "events": [
+        "request_admission"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null
+    },
+    {
+      "id": "sp-pre-route",
+      "title": "Preprocessing routes to thinker AND talker_ar (SHM)",
+      "node": "st_pre",
+      "edgeFrom": "sch_pre",
+      "lane": "preprocessing",
+      "thread": "preprocessing process",
+      "plane": "data",
+      "boundary": "process",
+      "function": "route_result → resolve_preprocessing_next_stages_speech → send_to_stage → CommRouter.outbound_payload (SHM)",
+      "caller": "preprocessing Stage.drain_outbox",
+      "callee": "thinker / talker_ar Stage.on_data_ready",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def resolve_preprocessing_next_stages_speech(",
+          "span": 15
+        },
+        {
+          "file": "sglang_omni/comm/router.py",
+          "anchor": "    def outbound_payload(",
+          "span": 21
+        }
+      ],
+      "input": "StagePayload with CPU prompt tensors",
+      "output": "two DataReadyMessages (SHM DataRefs)",
+      "requestPayload": "state.encoder_inputs: no model inputs (no media)",
+      "outputPayload": "targets = [\"thinker\", \"talker_ar\"]",
+      "state": "relay buffers held until each receiver's DataAckMessage",
+      "crossProcess": "Separate processes in the speech config: tensors via SHM relay, DataReadyMessage over ZMQ, DataAckMessage back.",
+      "errors": "Relay read failure at the receiver → negative ACK + send_failure.",
+      "rationale": "The talker gets the prompt early so it can start as soon as a few thinker tokens exist.",
+      "events": [
+        "stage_hop_sent"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED"
+    },
+    {
+      "id": "sp-fanin",
+      "title": "Thinker and talker each fan in (no mm_aggregate)",
+      "node": "st_tk",
+      "edgeFrom": "st_pre",
+      "lane": "talker_ar",
+      "thread": "thinker / talker processes · asyncio loops",
+      "plane": "data",
+      "boundary": "none",
+      "function": "AggregatedInput.receive → merge_for_thinker (thinker) / merge_for_talker (talker)",
+      "caller": "Stage.receive_payload_from_stage",
+      "callee": "Stage.execute → scheduler inbox",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/config.py",
+          "anchor": "def thinker_stage(",
+          "span": 20
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def merge_for_talker(",
+          "span": 15
+        }
+      ],
+      "input": "payload from preprocessing",
+      "output": "thinker: full thinker_inputs; talker: prompt + thinker_inputs only",
+      "requestPayload": "from_stage=\"preprocessing\"",
+      "outputPayload": "talker payload = Qwen3OmniPipelineState(prompt=..., thinker_inputs=...)",
+      "state": "AggregatedInput.pending per stage until expected sources arrive",
+      "errors": "Unexpected source → ValueError.",
+      "rationale": "The speech config moves fan-in into the AR stages themselves; wait_for_fn narrows sources per request.",
+      "events": [
+        "stage_aggregate_ready"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null
+    },
+    {
+      "id": "sp-talker-defer",
+      "title": "Talker payload waits: not build-ready yet",
+      "node": "sch_tk",
+      "edgeFrom": "st_tk",
+      "lane": "talker_ar",
+      "thread": "scheduler-talker_ar thread",
+      "plane": "control",
+      "boundary": "none",
+      "function": "OmniScheduler.process_input_requests → QwenTalkerScheduler.is_request_build_ready → deferred_request_payloads",
+      "caller": "talker scheduler loop",
+      "callee": "(waits for stream chunks)",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/talker_scheduler.py",
+          "anchor": "    def is_request_build_ready(",
+          "span": 17
+        }
+      ],
+      "input": "talker StagePayload",
+      "output": "deferred_request_payloads[rid] = payload",
+      "requestPayload": "payload.prefetched_chunks = []",
+      "outputPayload": "ready = usable_chunks >= partial_start_min_chunks (5 in the default speech config, 1 colocated)",
+      "state": "deferred until enough thinker chunks or stream_done",
+      "errors": "—",
+      "rationale": "The talker prefill needs some thinker text rows; starting after a few tokens instead of the whole reply is the partial start.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    },
+    {
+      "id": "sp-thinker-budget",
+      "title": "Thinker build: token budget capped by what the talker can say",
+      "node": "sch_thk",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "build_sglang_thinker_request(speaks=True) → thinker_max_new_tokens",
+      "caller": "request_builder (make_thinker_scheduler_adapters)",
+      "callee": "waiting_queue.append",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def thinker_max_new_tokens(",
+          "span": 13
+        }
+      ],
+      "input": "params.max_new_tokens={{max_tokens}}, talker_max_new_tokens",
+      "output": "Req with max_new_tokens = min(own, speech_token_budget)",
+      "requestPayload": "params = {max_new_tokens: {{max_tokens}}, ...}",
+      "outputPayload": "max_new_tokens = min({{max_tokens}}, speech_token_budget(talker_max_new_tokens))",
+      "state": "Req queued; prompt hidden states are captured for media prompts",
+      "errors": "As in the text path.",
+      "rationale": "A reply longer than the talker's codec budget could not be fully spoken.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    },
+    {
+      "id": "sp-thinker-stream",
+      "title": "Each thinker token streams to decode and talker_ar",
+      "node": "st_thk",
+      "edgeFrom": "sch_thk",
+      "lane": "thinker",
+      "thread": "scheduler-thinker → thinker asyncio loop",
+      "plane": "stream",
+      "boundary": "thread→async",
+      "function": "emit_stream_output → thinker stream_output_builder (targets decode + talker_ar)",
+      "caller": "OmniScheduler._run_batch / resolve",
+      "callee": "Stage.route_stream_run",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def make_thinker_stream_output_builder(",
+          "span": 58
+        }
+      ],
+      "input": "token_id per step",
+      "output": "OutgoingMessage(stream, target=decode) and (stream, target=talker_ar)",
+      "requestPayload": "req_output.data = token_id",
+      "outputPayload": "talker chunk: tensor([token_id]) (or prompt hidden rows on the first chunk when the prompt has media), metadata={token_id}",
+      "state": "req.is_prompt_hidden_handed_off set after the first talker chunk",
+      "errors": "Builder exception fails only this request.",
+      "rationale": "Talker consumes thinker text as it is produced, so speech starts long before the text reply ends.",
+      "events": [
+        "scheduler_first_emit"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null,
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "sp-inline-batch",
+      "title": "Tiny token chunks ride inline in StreamChunkBatchMessage",
+      "node": "st_tk",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "thinker process → talker process",
+      "plane": "stream",
+      "boundary": "process",
+      "function": "Stage.route_stream_run → batched_stream_chunk → send_stream_chunk_batch",
+      "caller": "thinker Stage.drain_outbox",
+      "callee": "talker Stage.schedule_stream_chunk_batch",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/stage/runtime.py",
+          "anchor": "    def batched_stream_chunk(",
+          "span": 48
+        }
+      ],
+      "input": "CPU tensor ≤ 16 KiB, metadata without tensors",
+      "output": "StreamChunkBatchMessage(request_ids, chunk_ids, dtypes, shapes, tensor_bytes, pickled_metadata)",
+      "requestPayload": "tensor([token_id]) (8 bytes)",
+      "outputPayload": "one ZMQ message carrying every pending chunk for talker_ar",
+      "state": "nonlocal_stream_targets[rid] ∋ talker_ar",
+      "crossProcess": "ZMQ only; no relay. Chunks larger than 16 KiB (e.g. hidden rows) fall back to the SHM relay.",
+      "errors": "Unpack failure fails each affected request.",
+      "rationale": "A relay round trip per 8-byte token would dominate; batching amortizes it.",
+      "events": [
+        "stage_stream_chunk_sent"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per drain cycle"
+    },
+    {
+      "id": "sp-talker-ingress",
+      "title": "Talker buffers chunks, then becomes build-ready",
+      "node": "sch_tk",
+      "edgeFrom": "st_tk",
+      "lane": "talker_ar",
+      "thread": "scheduler-talker_ar thread",
+      "plane": "control",
+      "boundary": "none",
+      "function": "OmniScheduler.on_stream_chunk → pending_stream_ingress → deferred recheck → is_request_build_ready",
+      "caller": "talker recv_requests (stream_chunk)",
+      "callee": "run_request_builder",
+      "code": [
+        {
+          "file": "sglang_omni/scheduling/omni_scheduler.py",
+          "anchor": "    def on_stream_chunk(self, request_id: str, chunk: StreamItem) -> None:",
+          "span": 22
+        }
+      ],
+      "input": "IncomingMessage(stream_chunk)",
+      "output": "payload.prefetched_chunks filled; build submitted",
+      "requestPayload": "5th usable thinker chunk arrives",
+      "outputPayload": "dirty_deferred_request_ids ∋ rid → rebuilt next loop",
+      "state": "pending_stream_ingress[rid].chunks grows",
+      "errors": "—",
+      "rationale": "Chunks may arrive before or after the payload; both orders converge here.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null,
+      "repeats": "per thinker token"
+    },
+    {
+      "id": "sp-talker-build",
+      "title": "Talker request build: thinker text → talker prefill embeddings",
+      "node": "sch_tk",
+      "lane": "talker_ar",
+      "thread": "scheduler-talker_ar thread",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "build_talker_request_data → TalkerPrefillBuilder.build_prompt_prefill → build_sglang_talker_request",
+      "caller": "talker request_builder",
+      "callee": "waiting_queue.append",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def build_talker_request_data(",
+          "span": 50
+        }
+      ],
+      "input": "payload + prefetched thinker chunks",
+      "output": "SGLangARRequestData with prefill input_embeds and pending_text_queue",
+      "requestPayload": "thinker_chunks = [5 token chunks], thinker_done=False",
+      "outputPayload": "talker Req(input_embeds=[rows], pending_text_queue=[future text rows], max_new_tokens=talker_max_new_tokens)",
+      "state": "talker sampling: temperature 0.9, top_k 50, repetition_penalty 1.05, top 1024 codec ids suppressed except EOS",
+      "errors": "No prefetched chunks → RuntimeError.",
+      "rationale": "Text not yet consumed by the prefill is kept as a queue fed into later decode steps.",
+      "events": [
+        "scheduler_request_build_start",
+        "scheduler_request_build_end"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null
+    },
+    {
+      "id": "sp-talker-decode",
+      "title": "Talker decode: feedback + next text; rows without text wait",
+      "node": "mr_tk",
+      "edgeFrom": "sch_tk",
+      "lane": "talker_ar",
+      "thread": "scheduler-talker_ar thread · GPU 1",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "QwenTalkerScheduler.update_running_batch (ready_decode_rows) → combine_feedback_with_next_text → forward",
+      "caller": "upstream get_next_batch_to_run",
+      "callee": "TpModelWorker forward",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/talker_scheduler.py",
+          "anchor": "    def update_running_batch(",
+          "span": 24
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/talker_model_runner.py",
+          "anchor": "    def combine_feedback_with_next_text(",
+          "span": 22
+        }
+      ],
+      "input": "running talker batch",
+      "output": "next codec token per ready row",
+      "requestPayload": "row input = feedback_embed(prev codec) + text_embed(next thinker token)",
+      "outputPayload": "excluded rows keep KV and rejoin when text arrives",
+      "state": "excluded_batch holds waiting rows for one step",
+      "errors": "Aborted rows with no input are cleaned up immediately.",
+      "rationale": "Speech must not run ahead of the text it speaks; excluding rows avoids padding with fake input.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null,
+      "repeats": "per talker step"
+    },
+    {
+      "id": "sp-codes",
+      "title": "Talker emits codec codes to code2wav (CUDA IPC relay)",
+      "node": "st_c2w",
+      "edgeFrom": "mr_tk",
+      "lane": "talker_ar",
+      "thread": "talker process → code2wav process",
+      "plane": "stream",
+      "boundary": "process",
+      "function": "post_decode → emit_code_chunks_and_feedback → put_code_messages → Stage.send_stream_to_target → outbound_stream",
+      "caller": "ModelRunner.execute (post hook)",
+      "callee": "code2wav Stage.on_stream_chunk",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/talker_model_runner.py",
+          "anchor": "    def emit_code_chunks_and_feedback(",
+          "span": 58
+        },
+        {
+          "file": "sglang_omni/comm/router.py",
+          "anchor": "    def outbound_stream(",
+          "span": 20
+        }
+      ],
+      "input": "output_codes snapshot",
+      "output": "OutgoingMessage(stream, target=code2wav, data=codes[1 or ≤10 rows])",
+      "requestPayload": "codec_frames_seen ≤ 10: one row per message",
+      "outputPayload": "later: 10 rows stacked per message (codec_coalesce_frames=10)",
+      "state": "pending_codec_rows, pending_feedback_queue per request",
+      "crossProcess": "GPU 1 → GPU 0: pooled CUDA IPC relay if peer access (else SHM); colocated config: local object + CUDA event.",
+      "errors": "Relay failure → stream error to the consumer → request failure.",
+      "rationale": "Early frames go one by one for first audio; later frames batch to match the code2wav window.",
+      "events": [
+        "stage_first_stream_chunk_sent"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "repeats": "per talker step (coalesced)"
+    },
+    {
+      "id": "sp-c2w-window",
+      "title": "code2wav ingests codes and decodes 10-frame windows",
+      "node": "sch_c2w",
+      "edgeFrom": "st_c2w",
+      "lane": "code2wav",
+      "thread": "scheduler-code2wav thread · GPU 0",
+      "plane": "compute",
+      "boundary": "none",
+      "function": "Code2WavScheduler.ingest → window_ready → run_ready_step → decode_windows → keep_audio",
+      "caller": "code2wav loop",
+      "callee": "outbox.put(stream audio)",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/code2wav_scheduler.py",
+          "anchor": "    def ingest(",
+          "span": 34
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/code2wav_scheduler.py",
+          "anchor": "    def window_ready(",
+          "span": 12
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/code2wav_scheduler.py",
+          "anchor": "    def keep_audio(",
+          "span": 22
+        }
+      ],
+      "input": "codec rows",
+      "output": "audio window (float32, 24 kHz)",
+      "requestPayload": "state.chunks (EOS row dropped)",
+      "outputPayload": "stream=true: OutgoingMessage(stream, data=audio_waveform_payload(window), metadata={modality: audio})",
+      "state": "audio_parts += window; pinned slot recycled after D2H copy",
+      "errors": "A failed window step fails its participants only.",
+      "rationale": "Windows with left context (25 frames) give continuous audio while streaming.",
+      "events": [
+        "code2wav_first_audio"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null,
+      "repeats": "per 10-frame window"
+    },
+    {
+      "id": "sp-audio-out",
+      "title": "Audio windows → Coordinator → SSE delta.audio",
+      "node": "http",
+      "edgeFrom": "st_c2w",
+      "lane": "code2wav",
+      "thread": "code2wav process → HTTP process",
+      "plane": "stream",
+      "boundary": "process",
+      "function": "Stage.send_stream_to_coordinator → handle_stream → Client.default_stream_builder (set_audio_data) → completion_stream (base64) → chat_stream_events",
+      "caller": "code2wav Stage.drain_outbox",
+      "callee": "SSE",
+      "code": [
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "    def set_audio_data(",
+          "span": 26
+        },
+        {
+          "file": "sglang_omni/serve/openai_api.py",
+          "anchor": "            # Audio chunk",
+          "span": 13
+        }
+      ],
+      "input": "StreamMessage(chunk={audio_waveform bytes, dtype, shape, sample_rate}, modality=audio)",
+      "output": "data: {\"choices\":[{\"delta\":{\"audio\":{\"id\":\"audio-{{request_id}}\",\"data\":\"<base64 wav>\"}}}]}",
+      "requestPayload": "audio_waveform_payload(window)",
+      "outputPayload": "delta.audio.data = base64(WAV of this window)",
+      "state": "Coordinator stream backlog counts audio bytes",
+      "crossProcess": "ZMQ msgpack carries the audio bytes.",
+      "errors": "Backlog over max_total_backlog_bytes fails the slowest-reading stream.",
+      "rationale": "Text and audio deltas are interleaved as separate SSE events.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "repeats": "per audio window"
+    },
+    {
+      "id": "sp-thinker-done",
+      "title": "Thinker finishes: stream_done to talker_ar and decode",
+      "node": "st_tk",
+      "edgeFrom": "st_thk",
+      "lane": "thinker",
+      "thread": "thinker process",
+      "plane": "control",
+      "boundary": "process",
+      "function": "Stage.route_result → get_stream_done_targets = resolve_thinker_stream_done_targets → send_stream_signal_to_target",
+      "caller": "thinker drain_outbox",
+      "callee": "talker/decode receive_stream_signal",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def resolve_thinker_stream_done_targets(",
+          "span": 10
+        }
+      ],
+      "input": "thinker result",
+      "output": "stream_done to [talker_ar, decode]; payload to decode",
+      "requestPayload": "should_generate_audio_output = True",
+      "outputPayload": "[\"talker_ar\", \"decode\"]",
+      "state": "talker: req_data.thinker_chunks_done = True (via stream_done_handler)",
+      "errors": "—",
+      "rationale": "The talker needs to know no more text is coming to finish its reply.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    },
+    {
+      "id": "sp-talker-done",
+      "title": "Talker finishes: flush codes, latch payload to code2wav",
+      "node": "st_c2w",
+      "edgeFrom": "st_tk",
+      "lane": "talker_ar",
+      "thread": "talker process",
+      "plane": "data",
+      "boundary": "process",
+      "function": "QwenTalkerModelRunner.on_request_finished → result_adapter → project_talker_to_code2wav → stream_done + payload",
+      "caller": "OmniScheduler.stream_output",
+      "callee": "code2wav Stage",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/talker_model_runner.py",
+          "anchor": "    def on_request_finished(",
+          "span": 17
+        },
+        {
+          "file": "sglang_omni/models/qwen3_omni/request_builders.py",
+          "anchor": "def project_talker_to_code2wav(",
+          "span": 8
+        }
+      ],
+      "input": "finished talker Req",
+      "output": "last code rows + stream_done + StagePayload(data={} or {NO_SPEECH: True})",
+      "requestPayload": "pending_codec_rows (last row may be EOS)",
+      "outputPayload": "StagePayload(data={})   # a latch: codes already went by stream",
+      "state": "talker KV released",
+      "errors": "—",
+      "rationale": "Code tensors never ride the payload; the payload only closes the request at code2wav.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    },
+    {
+      "id": "sp-c2w-final",
+      "title": "code2wav final result → CompleteMessage",
+      "node": "coordinator",
+      "edgeFrom": "st_c2w",
+      "lane": "code2wav",
+      "thread": "code2wav process → HTTP process",
+      "plane": "control",
+      "boundary": "process",
+      "function": "flush last window → Code2WavScheduler.final_result_data → Stage.route_result (terminal) → send_complete",
+      "caller": "code2wav loop",
+      "callee": "Coordinator.handle_completion",
+      "code": [
+        {
+          "file": "sglang_omni/models/qwen3_omni/components/code2wav_scheduler.py",
+          "anchor": "    def final_result_data(",
+          "span": 20
+        }
+      ],
+      "input": "stream_done + latch payload",
+      "output": "CompleteMessage(from_stage=code2wav, result=...)",
+      "requestPayload": "state.audio_parts = [windows...]",
+      "outputPayload": "stream=true: {\"modality\": \"audio\", \"sample_rate\": 24000}\nstream=false: full waveform payload (audio_waveform bytes, dtype, shape, sample_rate)",
+      "state": "codec slot released",
+      "errors": "No audio and no NO_SPEECH → RuntimeError → request failure.",
+      "rationale": "When streaming, the audio already went out; the final result carries only metadata.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    },
+    {
+      "id": "sp-merge",
+      "title": "Coordinator waits for both terminals and merges",
+      "node": "coordinator",
+      "lane": "coordinator",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Coordinator.handle_completion (multi-terminal) → partial_results → merged dict",
+      "caller": "run_completion_loop",
+      "callee": "future.set_result / stream end",
+      "code": [
+        {
+          "file": "sglang_omni/pipeline/coordinator.py",
+          "anchor": "        # Multi-terminal: collect partial results",
+          "span": 24
+        }
+      ],
+      "input": "CompleteMessage(decode), CompleteMessage(code2wav) in any order",
+      "output": "{\"decode\": {...}, \"code2wav\": {...}}",
+      "requestPayload": "partials = {\"decode\": ...}",
+      "outputPayload": "merged = {\"decode\": {...text...}, \"code2wav\": {...audio...}}",
+      "state": "partial_results[rid] until both arrive; then COMPLETED",
+      "errors": "Either terminal failing → fail-fast for the whole request.",
+      "rationale": "Text and audio finish independently; the client gets one result.",
+      "events": [
+        "terminal_response"
+      ],
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "crossProcess": null
+    },
+    {
+      "id": "sp-client",
+      "title": "Client attaches audio to the text result",
+      "node": "http",
+      "edgeFrom": "client",
+      "lane": "http",
+      "thread": "HTTP process · asyncio loop",
+      "plane": "control",
+      "boundary": "none",
+      "function": "Client.default_result_builder (decode + code2wav) → set_audio_data → completion (base64 WAV) / SSE finish",
+      "caller": "Client.generate",
+      "callee": "chat_non_stream / chat_stream_events",
+      "code": [
+        {
+          "file": "sglang_omni/client/client.py",
+          "anchor": "            # Multi-terminal merged result",
+          "span": 30
+        }
+      ],
+      "input": "merged dict",
+      "output": "CompletionResult(text, audio=CompletionAudio(data=base64 wav, transcript=text))",
+      "requestPayload": "{\"decode\": ..., \"code2wav\": ...}",
+      "outputPayload": "message = {\"role\": \"assistant\", \"content\": \"...\", \"audio\": {\"id\": \"audio-{{request_id}}\", \"data\": \"<base64>\", \"transcript\": \"...\"}}",
+      "state": "—",
+      "errors": "No pipeline response → ClientError.",
+      "rationale": "Aggregation stays out of the HTTP layer.",
+      "scenarios": [
+        "speech"
+      ],
+      "status": "VERIFIED",
+      "events": [],
+      "crossProcess": null
+    }
+  ],
+  "pipelines": [
+    {
+      "id": "text",
+      "label": "Qwen3OmniPipelineConfig (text_stages)",
+      "status": "VERIFIED",
+      "traced": true,
+      "configRef": {
+        "file": "sglang_omni/models/qwen3_omni/config.py",
+        "anchor": "def text_stages() -> list[StageConfig]:",
+        "span": 9
+      },
+      "stages": [
+        {
+          "id": "preprocessing",
+          "scheduler": "SimpleScheduler",
+          "process": "pipeline",
+          "gpu": null,
+          "terminal": false,
+          "entry": true,
+          "waitFor": [],
+          "merge": null,
+          "note": ""
+        },
+        {
+          "id": "image_encoder",
+          "scheduler": "SimpleScheduler",
+          "process": "pipeline",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": "reached only with images/video"
+        },
+        {
+          "id": "audio_encoder",
+          "scheduler": "SimpleScheduler",
+          "process": "pipeline",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": "reached only with audio"
+        },
+        {
+          "id": "mm_aggregate",
+          "scheduler": "SimpleScheduler (identity)",
+          "process": "pipeline",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [
+            "preprocessing",
+            "image_encoder",
+            "audio_encoder"
+          ],
+          "merge": "merge_for_thinker",
+          "note": ""
+        },
+        {
+          "id": "thinker",
+          "scheduler": "OmniScheduler",
+          "process": "pipeline",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": ""
+        },
+        {
+          "id": "decode",
+          "scheduler": "StreamingDetokenizeScheduler",
+          "process": "pipeline",
+          "gpu": null,
+          "terminal": true,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": ""
+        }
+      ],
+      "edges": [
+        {
+          "source": "preprocessing",
+          "target": "image_encoder",
+          "kind": "payload",
+          "conditional": "resolve_preprocessing_next_stages: only if image/video model inputs"
+        },
+        {
+          "source": "preprocessing",
+          "target": "audio_encoder",
+          "kind": "payload",
+          "conditional": "resolve_preprocessing_next_stages: only if audio model inputs"
+        },
+        {
+          "source": "preprocessing",
+          "target": "mm_aggregate",
+          "kind": "payload"
+        },
+        {
+          "source": "image_encoder",
+          "target": "mm_aggregate",
+          "kind": "payload"
+        },
+        {
+          "source": "audio_encoder",
+          "target": "mm_aggregate",
+          "kind": "payload"
+        },
+        {
+          "source": "mm_aggregate",
+          "target": "thinker",
+          "kind": "payload"
+        },
+        {
+          "source": "thinker",
+          "target": "decode",
+          "kind": "payload"
+        },
+        {
+          "source": "thinker",
+          "target": "decode",
+          "kind": "stream",
+          "conditional": "only when params.stream is true (make_thinker_stream_output_builder)"
+        },
+        {
+          "source": "decode",
+          "target": "coordinator",
+          "kind": "control"
+        }
+      ]
+    },
+    {
+      "id": "speech",
+      "label": "Qwen3OmniSpeechPipelineConfig (speech_stages)",
+      "status": "VERIFIED",
+      "traced": true,
+      "configRef": {
+        "file": "sglang_omni/models/qwen3_omni/config.py",
+        "anchor": "def speech_stages(",
+        "span": 38
+      },
+      "stages": [
+        {
+          "id": "preprocessing",
+          "scheduler": "SimpleScheduler",
+          "process": "preprocessing",
+          "gpu": null,
+          "terminal": false,
+          "entry": true,
+          "waitFor": [],
+          "merge": null,
+          "note": ""
+        },
+        {
+          "id": "image_encoder",
+          "scheduler": "SimpleScheduler",
+          "process": "image_encoder",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": "thinker_gpu"
+        },
+        {
+          "id": "audio_encoder",
+          "scheduler": "SimpleScheduler",
+          "process": "audio_encoder",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": "thinker_gpu"
+        },
+        {
+          "id": "thinker",
+          "scheduler": "OmniScheduler",
+          "process": "thinker",
+          "gpu": 0,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [
+            "preprocessing",
+            "image_encoder",
+            "audio_encoder"
+          ],
+          "merge": "merge_for_thinker",
+          "note": ""
+        },
+        {
+          "id": "decode",
+          "scheduler": "StreamingDetokenizeScheduler",
+          "process": "decode",
+          "gpu": null,
+          "terminal": true,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": ""
+        },
+        {
+          "id": "talker_ar",
+          "scheduler": "OmniScheduler (talker)",
+          "process": "talker_ar",
+          "gpu": 1,
+          "terminal": false,
+          "entry": false,
+          "waitFor": [
+            "preprocessing",
+            "image_encoder",
+            "audio_encoder"
+          ],
+          "merge": "merge_for_talker",
+          "note": ""
+        },
+        {
+          "id": "code2wav",
+          "scheduler": "Code2WavScheduler",
+          "process": "code2wav",
+          "gpu": 0,
+          "terminal": true,
+          "entry": false,
+          "waitFor": [],
+          "merge": null,
+          "note": "terminal only when audio output is requested (resolve_terminal_stages)"
+        }
+      ],
+      "edges": [
+        {
+          "source": "preprocessing",
+          "target": "image_encoder",
+          "kind": "payload",
+          "conditional": "only if image/video model inputs"
+        },
+        {
+          "source": "preprocessing",
+          "target": "audio_encoder",
+          "kind": "payload",
+          "conditional": "only if audio model inputs"
+        },
+        {
+          "source": "preprocessing",
+          "target": "thinker",
+          "kind": "payload"
+        },
+        {
+          "source": "preprocessing",
+          "target": "talker_ar",
+          "kind": "payload",
+          "conditional": "only if audio output (resolve_preprocessing_next_stages_speech)"
+        },
+        {
+          "source": "image_encoder",
+          "target": "thinker",
+          "kind": "payload"
+        },
+        {
+          "source": "image_encoder",
+          "target": "talker_ar",
+          "kind": "payload",
+          "conditional": "only if audio output (resolve_encoder_next_stages)"
+        },
+        {
+          "source": "audio_encoder",
+          "target": "thinker",
+          "kind": "payload"
+        },
+        {
+          "source": "audio_encoder",
+          "target": "talker_ar",
+          "kind": "payload",
+          "conditional": "only if audio output"
+        },
+        {
+          "source": "thinker",
+          "target": "decode",
+          "kind": "payload"
+        },
+        {
+          "source": "thinker",
+          "target": "decode",
+          "kind": "stream",
+          "conditional": "when params.stream is true"
+        },
+        {
+          "source": "thinker",
+          "target": "talker_ar",
+          "kind": "stream",
+          "conditional": "when audio output; first chunk carries prompt hidden rows"
+        },
+        {
+          "source": "talker_ar",
+          "target": "code2wav",
+          "kind": "payload",
+          "conditional": "project_talker_to_code2wav: request latch only"
+        },
+        {
+          "source": "talker_ar",
+          "target": "code2wav",
+          "kind": "stream",
+          "conditional": "codec code chunks"
+        },
+        {
+          "source": "decode",
+          "target": "coordinator",
+          "kind": "control"
+        },
+        {
+          "source": "code2wav",
+          "target": "coordinator",
+          "kind": "control",
+          "conditional": "audio output only"
+        }
+      ]
+    }
+  ]
+}
